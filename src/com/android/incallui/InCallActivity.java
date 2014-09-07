@@ -30,10 +30,13 @@ import com.android.services.telephony.common.CallDetails;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.FragmentTransaction;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.DialogInterface;
-import android.content.DialogInterface.OnClickListener;
 import android.content.DialogInterface.OnCancelListener;
+import android.content.DialogInterface.OnClickListener;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.res.Configuration;
 import android.content.res.Resources;
 import android.database.ContentObserver;
@@ -42,12 +45,17 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.provider.Settings;
 import android.telephony.MSimTelephonyManager;
+import android.util.DisplayMetrics;
+import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowManager;
+import android.view.WindowManagerPolicy;
 import android.view.accessibility.AccessibilityEvent;
+import android.widget.FrameLayout;
 import android.widget.Toast;
 
 /**
@@ -86,6 +94,19 @@ public class InCallActivity extends Activity {
         }
     };
 
+    private int[] mCoverWindowCoords = null;
+    private BroadcastReceiver mLidStateChangeReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (WindowManagerPolicy.ACTION_LID_STATE_CHANGED.equals(intent.getAction())) {
+                boolean on = intent.getIntExtra(WindowManagerPolicy.EXTRA_LID_STATE,
+                        WindowManagerPolicy.WindowManagerFuncs.LID_ABSENT)
+                        == WindowManagerPolicy.WindowManagerFuncs.LID_CLOSED;
+                showSmartCover(on);
+            }
+        }
+    };
+
     @Override
     protected void onCreate(Bundle icicle) {
         Log.d(this, "onCreate()...  this = " + this);
@@ -95,6 +116,13 @@ public class InCallActivity extends Activity {
         if (MSimTelephonyManager.getDefault().getMultiSimConfiguration()
                 == MSimTelephonyManager.MultiSimVariants.DSDA) {
             return;
+        }
+
+        mCoverWindowCoords = getResources().getIntArray(
+                com.android.internal.R.array.config_smartCoverWindowCoords);
+        if (mCoverWindowCoords != null && mCoverWindowCoords.length != 4) {
+            // make sure there are exactly 4 dimensions provided, or ignore
+            mCoverWindowCoords = null;
         }
 
         // set this flag so this activity will stay in front of the keyguard
@@ -119,6 +147,16 @@ public class InCallActivity extends Activity {
                 Settings.System.getUriFor(Settings.System.INCOMING_CALL_STYLE),
                 false, mSettingsObserver);
         updateSettings();
+
+        // Handle the Intent we were launched with, but only if this is the
+        // the very first time we're being launched (ie. NOT if we're being
+        // re-initialized after previously being shut down.)
+        // Once we're up and running, any future Intents we need
+        // to handle will come in via the onNewIntent() method.
+        if (icicle == null) {
+            Log.d(this, "this is our very first launch, checking intent...");
+            internalResolveIntent(getIntent());
+        }
 
         Log.d(this, "onCreate(): exit");
     }
@@ -150,6 +188,15 @@ public class InCallActivity extends Activity {
             mShowDialpadRequested = false;
         }
         updateSystemBarTranslucency();
+        if (mCoverWindowCoords != null) {
+            registerReceiver(mLidStateChangeReceiver, new IntentFilter(
+                    WindowManagerPolicy.ACTION_LID_STATE_CHANGED));
+        }
+
+        final Call call = CallList.getInstance().getIncomingCall();
+        if (call != null) {
+            CallCommandClient.getInstance().setSystemBarNavigationEnabled(false);
+        }
     }
 
     // onPause is guaranteed to be called when the InCallActivity goes
@@ -158,12 +205,17 @@ public class InCallActivity extends Activity {
     protected void onPause() {
         Log.d(this, "onPause()...");
         super.onPause();
+        if (mCoverWindowCoords != null) {
+            unregisterReceiver(mLidStateChangeReceiver);
+        }
 
         mIsForegroundActivity = false;
 
         mDialpadFragment.onDialerKeyUp(null);
 
         InCallPresenter.getInstance().onUiShowing(false);
+
+        CallCommandClient.getInstance().setSystemBarNavigationEnabled(true);
     }
 
     @Override
@@ -454,6 +506,55 @@ public class InCallActivity extends Activity {
         }
     }
 
+    protected void showSmartCover(boolean show) {
+        mAnswerFragment.getView().setVisibility(show ? View.INVISIBLE : View.VISIBLE);
+
+        DisplayMetrics metrics = getResources().getDisplayMetrics();
+        final int windowHeight = mCoverWindowCoords[2] - mCoverWindowCoords[0];
+        final int windowWidth = metrics.widthPixels - mCoverWindowCoords[1]
+                - (metrics.widthPixels - mCoverWindowCoords[3]);
+
+        final int stretch = ViewGroup.LayoutParams.MATCH_PARENT;
+
+        View main = findViewById(R.id.main);
+        View callCard = mCallCardFragment.getView();
+        if (show) {
+            // clear bg color
+            main.setBackground(null);
+
+            // center
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(windowWidth, stretch);
+            lp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+            main.setLayoutParams(lp);
+
+            // adjust callcard height
+            ViewGroup.LayoutParams params = callCard.getLayoutParams();
+            params.height = windowHeight;
+
+            callCard.setSystemUiVisibility(callCard.getSystemUiVisibility()
+                    | View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION);
+
+            // disable touches
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE);
+        } else {
+            // reset default parameters
+            main.setBackgroundColor(R.color.incall_button_background);
+
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(stretch, stretch);
+            main.setLayoutParams(lp);
+
+            ViewGroup.LayoutParams params = mCallCardFragment.getView().getLayoutParams();
+            params.height = stretch;
+
+            callCard.setSystemUiVisibility(callCard.getSystemUiVisibility()
+                    & ~View.SYSTEM_UI_FLAG_FULLSCREEN & ~View.SYSTEM_UI_FLAG_HIDE_NAVIGATION);
+
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE);
+        }
+        callCard.invalidate();
+        main.requestLayout();
+    }
+
     private void toast(String text) {
         final Toast toast = Toast.makeText(this, text, Toast.LENGTH_SHORT);
 
@@ -499,6 +600,8 @@ public class InCallActivity extends Activity {
             mConferenceManagerFragment.setVisible(true);
             mConferenceManagerShown = true;
             updateSystemBarTranslucency();
+        } else {
+            mConferenceManagerFragment.setVisible(false);
         }
     }
 
@@ -671,8 +774,7 @@ public class InCallActivity extends Activity {
         Log.d(this, "maybeShowErrorDialogOnDisconnect: Call=" + call);
 
         if (!isFinishing() && call != null) {
-            final int resId = getResIdForDisconnectCause(call.getDisconnectCause(),
-                    call.getSuppServNotification());
+            final int resId = getResIdForDisconnectCause(call);
             if (resId != INVALID_RES_ID) {
                 showErrorDialog(resId);
             }
@@ -775,26 +877,18 @@ public class InCallActivity extends Activity {
         mDialog.show();
     }
 
-    private int getResIdForDisconnectCause(Call.DisconnectCause cause,
-            Call.SsNotification notification) {
+    private int getResIdForDisconnectCause(Call call) {
+        Call.DisconnectCause cause = call.getDisconnectCause();
         int resId = INVALID_RES_ID;
 
         if (cause == Call.DisconnectCause.INCOMING_MISSED) {
-            // If the network sends SVC Notification then this dialog will be displayed
-            // in case of B when the incoming call at B is not answered and gets forwarded
-            // to C
-            if (notification != null && notification.notificationType == 1 &&
-                    notification.code ==
-                    Call.SsNotification.MT_CODE_ADDITIONAL_CALL_FORWARDED) {
+            if (call.wasAdditionalCallForwarded()) {
                 resId = R.string.callUnanswered_forwarded;
             }
         } else if (cause == Call.DisconnectCause.CALL_BARRED) {
             // When call is disconnected with this code then it can either be barring from
             // MO side or MT side.
-            // In MT case, if network sends SVC Notification then this dialog will be
-            // displayed when A is calling B & incoming is barred on B.
-            if (notification != null && notification.notificationType == 0 &&
-                    notification.code == Call.SsNotification.MO_CODE_INCOMING_CALLS_BARRED) {
+            if (call.isRemoteIncomingCallBarringEnabled()) {
                 resId = R.string.callFailed_incoming_cb_enabled;
             } else {
                 resId = R.string.callFailed_cb_enabled;
